@@ -1,0 +1,1167 @@
+#!/usr/bin/env python3
+"""Poll Lark as the authorized user and add reactions to recent messages.
+
+This public entrypoint keeps local identity and runtime state in flags or
+environment variables, so the repo stays reusable and free of personal context.
+"""
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+import random
+import re
+import signal
+import subprocess
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+APP_NAME = "lark-reaction-as-user"
+DEFAULT_STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state")) / APP_NAME
+DEFAULT_LOG_DIR = DEFAULT_STATE_DIR / "logs"
+DEFAULT_PREFERENCE_PATH = Path(__file__).resolve().parents[1] / "preference.yaml"
+
+BASE_REACTION_CHOICES = ["OK", "THUMBSUP", "JIAYI", "DONE", "Yes", "Get", "LAUGH", "LOL", "LOVE", "HUSKY", "AWESOMEN", "SMILE", "THINKING"]
+REACTION_CHOICES = BASE_REACTION_CHOICES[:]
+REACTION_BLACKLIST = {"SMILE", "THINKING"}
+TOP_REACTIONS = 5
+CONTEXT_MESSAGES = 10
+STYLE_HINT = ""
+EXPLICIT_JIAYI_RE = re.compile(r"(?:\+|＋)\s*1|加\s*(?:一|1)")
+
+RUNNING = True
+LOCK_FH = None
+API_FAILURES: list[dict] = []
+
+USER_OPEN_ID = ""
+STATE_DIR = DEFAULT_STATE_DIR
+LOG_DIR = DEFAULT_LOG_DIR
+CURSOR_FILE = STATE_DIR / "cursor"
+CHAT_CURSOR_STATE_FILE = STATE_DIR / "chat_cursor.json"
+REACTED_FILE = STATE_DIR / "reacted"
+CHAT_REACTION_STATE_FILE = STATE_DIR / "chat_reaction_state.json"
+LOG_FILE = LOG_DIR / "poller.log"
+LOCK_FILE = STATE_DIR / "poller.lock"
+HEARTBEAT_FILE = STATE_DIR / "heartbeat.json"
+
+POLL_INTERVAL_SEC = 15
+LOOKBACK_INIT_SEC = 300
+P2P_SCAN_LIMIT = 5
+P2P_FETCH_WORKERS = 8
+CHAT_REACTION_COOLDOWN_SEC = 300
+DRY_RUN = False
+DISABLE_LLM = False
+
+
+def env_bool(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def parse_csv_set(value: str) -> set[str]:
+    return {part.strip() for part in value.split(",") if part.strip()}
+
+
+def parse_scalar(value: str):
+    value = value.strip()
+    if not value:
+        return ""
+    if value.lower() in {"true", "false"}:
+        return value.lower() == "true"
+    if re.fullmatch(r"-?\d+", value):
+        return int(value)
+    if (value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'")):
+        return value[1:-1]
+    if "," in value:
+        return [part.strip() for part in value.split(",") if part.strip()]
+    return value
+
+
+def load_preferences(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    data: dict[str, object] = {}
+    current_key = ""
+    for raw_line in path.read_text().splitlines():
+        line = raw_line.split("#", 1)[0].rstrip()
+        if not line.strip():
+            continue
+        if line.startswith("  - ") and current_key:
+            data.setdefault(current_key, [])
+            if isinstance(data[current_key], list):
+                data[current_key].append(parse_scalar(line[4:]))
+            continue
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        current_key = key.strip()
+        value = value.strip()
+        data[current_key] = [] if value == "" else parse_scalar(value)
+    return data
+
+
+def as_list(value) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, str):
+        return [part.strip() for part in value.split(",") if part.strip()]
+    return [str(value)]
+
+
+def lark_user_open_id() -> str:
+    try:
+        r = subprocess.run(
+            ["lark-cli", "auth", "status", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if r.returncode != 0:
+            return ""
+        data = json.loads(r.stdout)
+        return str((((data.get("identities") or {}).get("user") or {}).get("openId")) or "")
+    except Exception:
+        return ""
+
+
+def configure(args: argparse.Namespace) -> None:
+    global USER_OPEN_ID, STATE_DIR, LOG_DIR
+    global CURSOR_FILE, CHAT_CURSOR_STATE_FILE, REACTED_FILE
+    global CHAT_REACTION_STATE_FILE, LOG_FILE, LOCK_FILE, HEARTBEAT_FILE
+    global POLL_INTERVAL_SEC, LOOKBACK_INIT_SEC, P2P_SCAN_LIMIT
+    global CHAT_REACTION_COOLDOWN_SEC, DRY_RUN, DISABLE_LLM
+    global REACTION_BLACKLIST, REACTION_CHOICES, TOP_REACTIONS
+    global CONTEXT_MESSAGES, STYLE_HINT
+
+    preference_path = Path(args.preference).expanduser()
+    prefs = load_preferences(preference_path)
+    USER_OPEN_ID = args.user_open_id or lark_user_open_id()
+    STATE_DIR = Path(args.state_dir or os.environ.get("LARK_REACTION_STATE_DIR", DEFAULT_STATE_DIR)).expanduser()
+    LOG_DIR = Path(args.log_dir or os.environ.get("LARK_REACTION_LOG_DIR", STATE_DIR / "logs")).expanduser()
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(STATE_DIR, 0o700)
+
+    CURSOR_FILE = STATE_DIR / "cursor"
+    CHAT_CURSOR_STATE_FILE = STATE_DIR / "chat_cursor.json"
+    REACTED_FILE = STATE_DIR / "reacted"
+    CHAT_REACTION_STATE_FILE = STATE_DIR / "chat_reaction_state.json"
+    LOG_FILE = LOG_DIR / "poller.log"
+    LOCK_FILE = STATE_DIR / "poller.lock"
+    HEARTBEAT_FILE = STATE_DIR / "heartbeat.json"
+
+    POLL_INTERVAL_SEC = args.poll_interval if args.poll_interval is not None else int(prefs.get("poll_interval_sec", 15))
+    LOOKBACK_INIT_SEC = args.lookback_sec if args.lookback_sec is not None else int(prefs.get("lookback_sec", 300))
+    P2P_SCAN_LIMIT = args.p2p_scan_limit if args.p2p_scan_limit is not None else int(prefs.get("p2p_scan_limit", 5))
+    CHAT_REACTION_COOLDOWN_SEC = args.chat_cooldown_sec if args.chat_cooldown_sec is not None else int(prefs.get("chat_cooldown_sec", 300))
+    DRY_RUN = args.dry_run
+    DISABLE_LLM = args.disable_llm or env_bool("LARK_REACTION_DISABLE_LLM")
+    blacklist_value = args.emoji_blacklist if args.emoji_blacklist is not None else prefs.get("emoji_blacklist", ["SMILE", "THINKING"])
+    allowlist_value = args.emoji_allowlist if args.emoji_allowlist is not None else prefs.get("emoji_allowlist", BASE_REACTION_CHOICES)
+    REACTION_BLACKLIST = set(as_list(blacklist_value))
+    allowlist = as_list(allowlist_value)
+    REACTION_CHOICES = [emoji for emoji in allowlist if emoji and emoji not in REACTION_BLACKLIST]
+    if not REACTION_CHOICES:
+        REACTION_CHOICES = ["OK"]
+    TOP_REACTIONS = args.top_reactions if args.top_reactions is not None else int(prefs.get("top_reactions", 5))
+    CONTEXT_MESSAGES = args.context_messages if args.context_messages is not None else int(prefs.get("context_messages", 10))
+    STYLE_HINT = str(prefs.get("style_hint", "") or "")
+
+
+def require_user_open_id() -> None:
+    if not USER_OPEN_ID:
+        raise SystemExit(
+            "missing user open_id; run `lark-cli auth login --scope auth:user.id:read` "
+            "or pass --user-open-id. The id is used to skip your own messages and search group messages that @ you."
+        )
+
+
+def log(line: str) -> None:
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    with LOG_FILE.open("a") as f:
+        f.write(f"[{ts}] {line}\n")
+
+
+def write_heartbeat(status: str, **fields) -> None:
+    payload = {
+        "pid": os.getpid(),
+        "status": status,
+        "updated_ts": int(time.time()),
+        "state_dir": str(STATE_DIR),
+        "log_file": str(LOG_FILE),
+        **fields,
+    }
+    HEARTBEAT_FILE.write_text(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+
+
+def run_json(cmd: list[str], timeout: int = 25) -> dict | None:
+    global API_FAILURES
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        if r.returncode != 0:
+            log(f"cmd failed rc={r.returncode} cmd={cmd[:4]} stderr={r.stderr[:240]}")
+            API_FAILURES.append({
+                "ts": int(time.time()),
+                "cmd": " ".join(cmd[:4]),
+                "rc": r.returncode,
+                "stderr": r.stderr[:240],
+            })
+            API_FAILURES = API_FAILURES[-50:]
+            return None
+        return json.loads(r.stdout)
+    except Exception as e:
+        log(f"cmd exception cmd={cmd[:4]} err={e}")
+        API_FAILURES.append({
+            "ts": int(time.time()),
+            "cmd": " ".join(cmd[:4]),
+            "rc": -1,
+            "stderr": f"{type(e).__name__}: {str(e)[:200]}",
+        })
+        API_FAILURES = API_FAILURES[-50:]
+        return None
+
+
+def read_cursor() -> int:
+    try:
+        return int(CURSOR_FILE.read_text().strip())
+    except Exception:
+        return int(time.time()) - LOOKBACK_INIT_SEC
+
+
+def write_cursor(ts: int) -> None:
+    if DRY_RUN:
+        log(f"dry-run skip write_cursor ts={ts}")
+        return
+    CURSOR_FILE.write_text(str(ts))
+
+
+def read_chat_cursors() -> dict[str, int]:
+    try:
+        data = json.loads(CHAT_CURSOR_STATE_FILE.read_text())
+        return {str(k): int(v) for k, v in data.items()}
+    except Exception:
+        return {}
+
+
+def write_chat_cursors(cursors: dict[str, int]) -> None:
+    if DRY_RUN:
+        log("dry-run skip write_chat_cursors")
+        return
+    CHAT_CURSOR_STATE_FILE.write_text(json.dumps(cursors, sort_keys=True))
+
+
+def read_reacted() -> set[str]:
+    if not REACTED_FILE.exists():
+        return set()
+    return {ln.strip() for ln in REACTED_FILE.read_text().splitlines() if ln.strip()}
+
+
+def mark_reacted(msg_id: str) -> None:
+    if DRY_RUN:
+        log(f"dry-run skip mark_reacted msg={msg_id}")
+        return
+    with REACTED_FILE.open("a") as f:
+        f.write(msg_id + "\n")
+
+
+def read_chat_state() -> dict[str, int]:
+    try:
+        data = json.loads(CHAT_REACTION_STATE_FILE.read_text())
+        return {str(k): int(v) for k, v in data.items()}
+    except Exception:
+        return {}
+
+
+def write_chat_state(state: dict[str, int]) -> None:
+    if DRY_RUN:
+        log("dry-run skip write_chat_state")
+        return
+    CHAT_REACTION_STATE_FILE.write_text(json.dumps(state, sort_keys=True))
+
+
+def should_react_chat(chat_state: dict[str, int], chat_id: str, ts: int) -> bool:
+    last_ts = chat_state.get(chat_id, 0)
+    return ts <= 0 or last_ts <= 0 or ts - last_ts >= CHAT_REACTION_COOLDOWN_SEC
+
+
+def mark_chat_reacted(chat_state: dict[str, int], chat_id: str, ts: int) -> None:
+    chat_state[chat_id] = max(ts, chat_state.get(chat_id, 0))
+    write_chat_state(chat_state)
+
+
+def iso_utc(ts: int) -> str:
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse_create_time(value: str) -> int:
+    if not value:
+        return 0
+    s = str(value).strip()
+    if s.isdigit():
+        n = int(s)
+        return n // 1000 if n > 10_000_000_000 else n
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S"):
+        try:
+            dt = datetime.strptime(s, fmt)
+            return int((dt - timedelta(hours=8)).replace(tzinfo=timezone.utc).timestamp())
+        except Exception:
+            pass
+    return 0
+
+
+def extract_text(msg: dict) -> str:
+    content = msg.get("content", "") or msg.get("body", {}).get("content", "")
+    try:
+        parsed = json.loads(content)
+        if isinstance(parsed, dict) and "text" in parsed:
+            return parsed["text"]
+    except Exception:
+        pass
+    return content or ""
+
+
+def is_human_sender(sender: dict) -> bool:
+    return (sender or {}).get("sender_type") == "user"
+
+
+def list_recent_chat_context(chat_id: str, limit: int | None = None) -> list[dict]:
+    limit = limit or CONTEXT_MESSAGES
+    out = run_json([
+        "lark-cli", "im", "+chat-messages-list",
+        "--as", "user",
+        "--chat-id", chat_id,
+        "--page-size", str(limit),
+        "--order", "desc",
+        "--format", "json",
+    ], timeout=12)
+    messages = ((out or {}).get("data", {}) or {}).get("messages", []) or []
+    return list(reversed(messages))
+
+
+def context_with_target(messages: list[dict], target_msg: dict, limit: int | None = None) -> list[dict]:
+    limit = limit or CONTEXT_MESSAGES
+    target_id = target_msg.get("message_id", "")
+    merged = []
+    seen = set()
+    for msg in messages:
+        msg_id = msg.get("message_id", "")
+        key = msg_id or f"anon:{len(merged)}"
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(msg)
+    if target_id and target_id not in seen:
+        merged.append(target_msg)
+    merged.sort(key=lambda row: parse_create_time(row.get("create_time", "")))
+    if target_id:
+        for idx, msg in enumerate(merged):
+            if msg.get("message_id") == target_id:
+                return merged[max(0, idx - limit + 1):idx + 1]
+    return merged[-limit:]
+
+
+def list_target_chat_context(chat_id: str, target_msg: dict, limit: int | None = None) -> list[dict]:
+    limit = limit or CONTEXT_MESSAGES
+    target_ts = parse_create_time(target_msg.get("create_time", ""))
+    if not target_ts:
+        return context_with_target(list_recent_chat_context(chat_id, limit), target_msg, limit)
+    out = run_json([
+        "lark-cli", "im", "+chat-messages-list",
+        "--as", "user",
+        "--chat-id", chat_id,
+        "--end", iso_utc(target_ts + 1),
+        "--page-size", str(limit),
+        "--order", "desc",
+        "--format", "json",
+    ], timeout=12)
+    messages = ((out or {}).get("data", {}) or {}).get("messages", []) or []
+    return context_with_target(list(reversed(messages)), target_msg, limit)
+
+
+def format_context(messages: list[dict], target_msg_id: str) -> str:
+    rows = []
+    for msg in messages[-CONTEXT_MESSAGES:]:
+        sender = msg.get("sender", {}) or {}
+        who = sender.get("name") or sender.get("sender_type") or sender.get("id") or "unknown"
+        marker = " <TARGET>" if msg.get("message_id") == target_msg_id else ""
+        text = extract_text(msg).replace("\n", " ")[:240]
+        rows.append(f"- [{msg.get('create_time', '?')}] {who}{marker}: {text}")
+    return "\n".join(rows)
+
+
+def reaction_emoji(row: dict) -> str:
+    reaction_type = row.get("reaction_type") if isinstance(row, dict) else None
+    if isinstance(reaction_type, dict):
+        return str(reaction_type.get("emoji_type") or "")
+    return str(row.get("emoji_type") or "") if isinstance(row, dict) else ""
+
+
+def reaction_operator_id(row: dict) -> str:
+    operator = row.get("operator") if isinstance(row, dict) else None
+    if isinstance(operator, dict):
+        return str(operator.get("operator_id") or "")
+    return str(row.get("operator_id") or "")
+
+
+def own_reaction_top(messages: list[dict], limit: int = TOP_REACTIONS) -> list[str]:
+    counts: dict[str, int] = {}
+    if limit <= 0:
+        return []
+    for msg in messages:
+        reactions = msg.get("reactions")
+        if not isinstance(reactions, dict):
+            continue
+        rows = []
+        details = reactions.get("details")
+        if isinstance(details, list):
+            rows.extend(details)
+        items = reactions.get("items")
+        if isinstance(items, list):
+            rows.extend(items)
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            emoji = reaction_emoji(row)
+            if not emoji or emoji in REACTION_BLACKLIST:
+                continue
+            if reaction_operator_id(row) == USER_OPEN_ID:
+                counts[emoji] = counts.get(emoji, 0) + 1
+    return [emoji for emoji, _count in sorted(counts.items(), key=lambda item: (-item[1], item[0]))[:limit]]
+
+
+def allowed_reactions(context_messages: list[dict] | None = None) -> list[str]:
+    choices = REACTION_CHOICES[:]
+    for emoji in own_reaction_top(context_messages or []):
+        if emoji not in choices and emoji not in REACTION_BLACKLIST:
+            choices.append(emoji)
+    return choices
+
+
+def parse_llm_reaction(output: str, allowed: list[str]) -> str | None:
+    text = output.strip()
+    try:
+        data = json.loads(text)
+        emoji = data.get("emoji_type")
+    except Exception:
+        m = re.search(r'"emoji_type"\s*:\s*"([^"]+)"', text)
+        emoji = m.group(1) if m else text.splitlines()[0].strip().strip("`\"'") if text else None
+    return emoji if emoji in allowed else None
+
+
+def deterministic_reaction(text: str) -> str | None:
+    return "JIAYI" if "JIAYI" in REACTION_CHOICES and EXPLICIT_JIAYI_RE.search(text or "") else None
+
+
+def fallback_reaction(text: str) -> str:
+    lower = (text or "").lower()
+    if re.search(r"(lol|lmao|haha|哈哈|笑死|笑疯|xswl|233)", lower) and "LAUGH" in REACTION_CHOICES:
+        return "LAUGH"
+    if re.search(r"(done|fixed|resolved|完成|搞定|已处理|处理好了|修好了|已修|done了)", lower) and "DONE" in REACTION_CHOICES:
+        return "DONE"
+    if re.search(r"(awesome|cool|amazing|牛|太强|厉害|漂亮|赞爆)", lower) and "AWESOMEN" in REACTION_CHOICES:
+        return "AWESOMEN"
+    if re.search(r"(love|喜欢|爱了|贴贴|抱抱)", lower) and "LOVE" in REACTION_CHOICES:
+        return "LOVE"
+    if re.search(r"(lgtm|sgtm|approve|赞同|支持|可以合|可以上|没问题|没毛病)", lower) and "THUMBSUP" in REACTION_CHOICES:
+        return "THUMBSUP"
+    if re.search(r"(yes|yep|是的|对的|可以|行|同意)", lower) and "Yes" in REACTION_CHOICES:
+        return "Yes"
+    if re.search(r"(got\s*it|收到|了解|明白|get了|知道了)", lower) and "Get" in REACTION_CHOICES:
+        return "Get"
+    neutral = [emoji for emoji in ("OK", "Get") if emoji in REACTION_CHOICES]
+    return random.choice(neutral) if neutral else REACTION_CHOICES[0]
+
+
+def run_codex_json(prompt: str, timeout: int, label: str) -> subprocess.CompletedProcess:
+    output_path = None
+    try:
+        import tempfile
+
+        with tempfile.NamedTemporaryFile(prefix="codex-lark-reaction-", suffix=".txt", delete=False) as f:
+            output_path = f.name
+        result = subprocess.run(
+            [
+                "codex",
+                "--ask-for-approval", "never",
+                "-c", 'model_reasoning_effort="low"',
+                "exec",
+                "--ignore-user-config",
+                "--ignore-rules",
+                "--ephemeral",
+                "--skip-git-repo-check",
+                "--sandbox", "read-only",
+                "--cd", str(Path.cwd()),
+                "--output-last-message", output_path,
+                "-",
+            ],
+            input=prompt,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        final = ""
+        try:
+            final = Path(output_path).read_text().strip()
+        except OSError:
+            pass
+        log(f"codex {label} rc={result.returncode} chars={len(final)} out={(result.stdout + result.stderr)[:240]}")
+        if result.returncode == 0 and final:
+            return subprocess.CompletedProcess(result.args, 0, json.dumps({"result": final}, ensure_ascii=False), result.stderr)
+        return result
+    except subprocess.TimeoutExpired:
+        log(f"codex {label} timeout")
+        return subprocess.CompletedProcess(["codex"], 124, "", "timeout")
+    except Exception as e:
+        log(f"codex {label} exception err={type(e).__name__}: {str(e)[:160]}")
+        return subprocess.CompletedProcess(["codex"], 1, "", str(e))
+    finally:
+        if output_path:
+            try:
+                Path(output_path).unlink()
+            except OSError:
+                pass
+
+
+def run_model_json(prompt: str, timeout: int, label: str, attempts: int = 2) -> subprocess.CompletedProcess:
+    if DISABLE_LLM:
+        return subprocess.CompletedProcess(["disabled"], 1, "", "llm disabled")
+
+    last = subprocess.CompletedProcess(["claude"], 1, "", "")
+    for attempt in range(1, attempts + 1):
+        try:
+            result = subprocess.run(
+                ["claude", "-p", prompt, "--output-format", "json"],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            log(f"claude {label} timeout attempt={attempt}")
+            last = subprocess.CompletedProcess(["claude"], 124, "", "timeout")
+        else:
+            if result.returncode == 0:
+                return result
+            log(f"claude {label} failed attempt={attempt} rc={result.returncode} out={(result.stdout + result.stderr)[:240]}")
+            last = result
+        if attempt < attempts:
+            time.sleep(2)
+    codex_result = run_codex_json(prompt, timeout, label)
+    return codex_result if codex_result.returncode == 0 else last
+
+
+def choose_reaction(text: str, msg: dict, context_messages: list[dict], *, at_me: bool = False) -> str:
+    target_msg_id = msg.get("message_id", "")
+    allowed = allowed_reactions(context_messages)
+    top = own_reaction_top(context_messages)
+    fixed_emoji = deterministic_reaction(text)
+    if fixed_emoji:
+        log(f"deterministic reaction msg={target_msg_id} emoji={fixed_emoji}")
+        return fixed_emoji
+
+    prompt = f"""你是 Lark / 飞书消息 reaction 选择器。根据上下文判断这条目标消息最适合加哪个 reaction。
+
+只能从这些合法 emoji_type 中选一个:
+{", ".join(allowed)}
+
+这些 emoji_type 不要选:
+{", ".join(sorted(REACTION_BLACKLIST)) or "(none)"}
+
+如果语义合适，优先参考我最近常用的 reaction:
+{", ".join(top) or "(no recent own reactions found)"}
+
+个性化偏好:
+{STYLE_HINT or "(none)"}
+
+选择原则:
+- 不要默认都选 THUMBSUP；只有明确认可/赞同时才点赞。
+- 普通确认/收到类可选 OK 或 Get；是/同意类可选 Yes。
+- 明确要求 +1 / 加一时必须选 JIAYI；其它赞同/支持可选 THUMBSUP。
+- 轻松好笑可选 LAUGH 或 LOL；明确完成可选 DONE。
+- 亲近/喜欢/情绪支持可选 LOVE；轻松卖萌可选 HUSKY；强正反馈或 Cool 语义可选 AWESOMEN。
+- 如果上下文不足，选 OK，不要过度热情。
+
+是否群聊 @我/@all: {str(at_me).lower()}
+
+截至目标消息的最近上下文，<TARGET> 是要加 reaction 的消息:
+{format_context(context_messages, target_msg_id)}
+
+目标消息文本:
+{text[:500]}
+
+只输出 JSON，不要解释:
+{{"emoji_type":"OK"}}
+"""
+    try:
+        r = run_model_json(prompt, 45, f"reaction msg={target_msg_id}")
+        if r.returncode == 0:
+            payload = json.loads(r.stdout)
+            result = payload.get("result", r.stdout)
+            emoji = parse_llm_reaction(result, allowed)
+            if emoji:
+                log(f"llm reaction msg={target_msg_id} emoji={emoji}")
+                return emoji
+        emoji = fallback_reaction(text)
+        log(f"llm reaction fallback msg={target_msg_id} emoji={emoji} rc={r.returncode} out={(r.stdout + r.stderr)[:240]}")
+        return emoji
+    except Exception as e:
+        log(f"llm reaction exception msg={target_msg_id} err={type(e).__name__}: {str(e)[:160]}")
+    return fallback_reaction(text)
+
+
+def parse_llm_batch_reactions(output: str, allowed: list[str]) -> dict[str, str]:
+    text = output.strip()
+    try:
+        data = json.loads(text)
+    except Exception:
+        m = re.search(r"\{.*\}", text, flags=re.S)
+        data = json.loads(m.group(0)) if m else {}
+    rows = data.get("reactions") if isinstance(data, dict) else data
+    if not isinstance(rows, list):
+        return {}
+    parsed = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        msg_id = str(row.get("message_id") or "")
+        emoji = str(row.get("emoji_type") or "")
+        if msg_id and emoji in allowed:
+            parsed[msg_id] = emoji
+    return parsed
+
+
+def choose_reactions_batch(jobs: list[tuple[dict, list[dict], bool]]) -> dict[str, str]:
+    if not jobs:
+        return {}
+    if len(jobs) == 1:
+        msg, context, at_me = jobs[0]
+        return {msg.get("message_id", ""): choose_reaction(extract_text(msg), msg, context, at_me=at_me)}
+
+    all_context = []
+    for _msg, context, _at_me in jobs:
+        all_context.extend(context)
+    allowed = allowed_reactions(all_context)
+    top = own_reaction_top(all_context)
+    fixed = {}
+    targets = []
+    fallback = {}
+    for msg, context, at_me in jobs:
+        msg_id = msg.get("message_id", "")
+        text = extract_text(msg)
+        fixed_emoji = deterministic_reaction(text)
+        if msg_id and fixed_emoji:
+            fixed[msg_id] = fixed_emoji
+            log(f"deterministic reaction batch msg={msg_id} emoji={fixed_emoji}")
+            continue
+        targets.append({
+            "message_id": msg_id,
+            "group_mention": at_me,
+            "context": format_context(context, msg_id),
+            "target_text": text[:500],
+        })
+        fallback[msg_id] = fallback_reaction(text)
+    if not targets:
+        return fixed
+
+    prompt = f"""你是 Lark / 飞书消息 reaction 批量选择器。根据每条目标消息截至自身的最近上下文，给每条消息选择一个最合适的 reaction。
+
+只能从这些合法 emoji_type 中选:
+{", ".join(allowed)}
+
+这些 emoji_type 不要选:
+{", ".join(sorted(REACTION_BLACKLIST)) or "(none)"}
+
+如果语义合适，优先参考我最近常用的 reaction:
+{", ".join(top) or "(no recent own reactions found)"}
+
+个性化偏好:
+{STYLE_HINT or "(none)"}
+
+选择原则:
+- 不要默认都选 THUMBSUP；只有明确认可/赞同时才点赞。
+- 普通确认/收到类可选 OK 或 Get；是/同意类可选 Yes。
+- 明确要求 +1 / 加一时必须选 JIAYI；其它赞同/支持可选 THUMBSUP。
+- 轻松好笑可选 LAUGH 或 LOL；明确完成可选 DONE。
+- 亲近/喜欢/情绪支持可选 LOVE；轻松卖萌可选 HUSKY；强正反馈或 Cool 语义可选 AWESOMEN。
+- 如果上下文不足，选 OK，不要过度热情。
+- 必须为每个输入 message_id 输出一条结果。
+
+输入 targets(JSON):
+{json.dumps(targets, ensure_ascii=False)}
+
+只输出 JSON，不要解释:
+{{"reactions":[{{"message_id":"om_xxx","emoji_type":"OK"}}]}}
+"""
+    try:
+        r = run_model_json(prompt, 60, f"reaction batch count={len(jobs)}")
+        if r.returncode == 0:
+            payload = json.loads(r.stdout)
+            result = payload.get("result", r.stdout)
+            parsed = parse_llm_batch_reactions(result, allowed)
+            for msg_id, emoji in parsed.items():
+                log(f"llm reaction batch msg={msg_id} emoji={emoji}")
+            return {**fixed, **fallback, **parsed}
+        log(f"llm reaction batch fallback count={len(jobs)} rc={r.returncode} out={(r.stdout + r.stderr)[:240]}")
+    except Exception as e:
+        log(f"llm reaction batch exception count={len(jobs)} err={type(e).__name__}: {str(e)[:160]}")
+    return {**fixed, **fallback}
+
+
+def list_recent_p2p_chats(limit: int = P2P_SCAN_LIMIT) -> list[dict]:
+    out = run_json([
+        "lark-cli", "im", "+chat-list",
+        "--as", "user",
+        "--types", "p2p",
+        "--sort", "active_time",
+        "--page-size", str(limit),
+        "--format", "json",
+    ])
+    return ((out or {}).get("data", {}) or {}).get("chats", []) or []
+
+
+def list_chat_messages_since(chat_id: str, since_ts: int) -> list[dict]:
+    out = run_json([
+        "lark-cli", "im", "+chat-messages-list",
+        "--as", "user",
+        "--chat-id", chat_id,
+        "--start", iso_utc(since_ts),
+        "--end", iso_utc(int(time.time()) + 60),
+        "--page-size", "50",
+        "--order", "asc",
+        "--format", "json",
+    ], timeout=10)
+    return ((out or {}).get("data", {}) or {}).get("messages", []) or []
+
+
+def search_group_mentions_since(since_ts: int) -> tuple[list[dict], bool, bool]:
+    # lark-cli documents --at-chatter-ids as matching both direct mentions and @all.
+    out = run_json([
+        "lark-cli", "im", "+messages-search",
+        "--as", "user",
+        "--chat-type", "group",
+        "--at-chatter-ids", USER_OPEN_ID,
+        "--sender-type", "user",
+        "--start", iso_utc(since_ts),
+        "--end", iso_utc(int(time.time()) + 60),
+        "--page-size", "50",
+        "--page-all",
+        "--page-limit", "40",
+        "--format", "json",
+    ], timeout=45)
+    if out is None:
+        return [], False, False
+    data = (out.get("data", {}) or {})
+    return data.get("messages", []) or [], True, bool(data.get("has_more"))
+
+
+def search_p2p_since(since_ts: int) -> tuple[list[dict], bool, bool]:
+    out = run_json([
+        "lark-cli", "im", "+messages-search",
+        "--as", "user",
+        "--chat-type", "p2p",
+        "--sender-type", "user",
+        "--start", iso_utc(since_ts),
+        "--end", iso_utc(int(time.time()) + 60),
+        "--page-size", "50",
+        "--page-all",
+        "--page-limit", "40",
+        "--format", "json",
+    ], timeout=45)
+    if out is None:
+        return [], False, False
+    data = (out.get("data", {}) or {})
+    return data.get("messages", []) or [], True, bool(data.get("has_more"))
+
+
+def react(msg_id: str, emoji: str) -> str:
+    if DRY_RUN:
+        log(f"dry-run react msg={msg_id} emoji={emoji}")
+        return "ok"
+    try:
+        r = subprocess.run(
+            [
+                "lark-cli",
+                "im",
+                "reactions",
+                "create",
+                "--as",
+                "user",
+                "--params",
+                json.dumps({"message_id": msg_id}, ensure_ascii=False),
+                "--data",
+                json.dumps({"reaction_type": {"emoji_type": emoji}}, ensure_ascii=False),
+                "--format",
+                "json",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        if r.returncode != 0:
+            out = r.stdout + r.stderr
+            if "code\": 231017" in out or "not supported for this message type" in out:
+                log(f"react skipped unsupported msg={msg_id} emoji={emoji} rc={r.returncode} out={out[:240]}")
+                return "skip"
+            if "code\": 231001" in out or "reaction type is invalid" in out:
+                log(f"react skipped invalid_emoji msg={msg_id} emoji={emoji} rc={r.returncode} out={out[:240]}")
+                return "skip"
+            log(f"react failed msg={msg_id} emoji={emoji} rc={r.returncode} out={out[:240]}")
+            return "retry"
+        return "ok"
+    except Exception as e:
+        log(f"react exception msg={msg_id} emoji={emoji} err={e}")
+        return "retry"
+
+
+def collect_candidates_from_messages(
+    messages: list[dict],
+    *,
+    reacted: set[str],
+    chat_state: dict[str, int],
+    context_cache: dict[str, list[dict]],
+    planned_chats: set[str],
+    at_me: bool,
+    default_chat_id: str = "",
+) -> tuple[list[tuple[dict, list[dict], str, int]], int, int]:
+    candidates = []
+    max_ts = 0
+    suppressed = 0
+    for msg in messages:
+        ts = parse_create_time(msg.get("create_time", ""))
+        max_ts = max(max_ts, ts)
+        msg_id = msg.get("message_id", "")
+        chat_id = msg.get("chat_id", "") or default_chat_id
+        sender = msg.get("sender", {}) or {}
+        if not msg_id or not chat_id or msg_id in reacted or not is_human_sender(sender) or sender.get("id") == USER_OPEN_ID:
+            continue
+        if not should_react_chat(chat_state, chat_id, ts):
+            suppressed += 1
+            mark_reacted(msg_id)
+            reacted.add(msg_id)
+            log(f"suppressed cooldown chat={chat_id} msg={msg_id} ts={ts} last={chat_state.get(chat_id, 0)}")
+            continue
+        if chat_id in planned_chats:
+            suppressed += 1
+            log(f"suppressed already_planned_chat_reaction chat={chat_id} msg={msg_id} ts={ts}")
+            continue
+        planned_chats.add(chat_id)
+        context_key = f"{chat_id}:{msg_id}"
+        if context_key not in context_cache:
+            context_cache[context_key] = list_target_chat_context(chat_id, msg)
+        candidates.append((msg, context_cache.get(context_key, []), chat_id, ts))
+    return candidates, max_ts, suppressed
+
+
+def send_reactions(
+    candidates: list[tuple[dict, list[dict], str, int]],
+    *,
+    reacted: set[str],
+    chat_state: dict[str, int],
+    at_me: bool,
+) -> tuple[int, bool]:
+    emojis = choose_reactions_batch([(msg, context, at_me) for msg, context, _chat_id, _ts in candidates])
+    count = 0
+    failed = False
+    for msg, context, chat_id, ts in candidates:
+        msg_id = msg.get("message_id", "")
+        emoji = emojis.get(msg_id, "OK")
+        status = react(msg_id, emoji)
+        if status == "ok":
+            mark_reacted(msg_id)
+            reacted.add(msg_id)
+            mark_chat_reacted(chat_state, chat_id, ts)
+            count += 1
+            log(f"reacted emoji={emoji} chat={chat_id} msg={msg_id}")
+        elif status == "skip":
+            mark_reacted(msg_id)
+            reacted.add(msg_id)
+            log(f"skipped permanent_reaction_failure emoji={emoji} chat={chat_id} msg={msg_id}")
+        else:
+            failed = True
+    return count, failed
+
+
+def poll_once() -> dict:
+    api_failure_start = len(API_FAILURES)
+    write_heartbeat("load_state")
+    cursor = read_cursor()
+    chat_cursors = read_chat_cursors()
+    reacted = read_reacted()
+    chat_state = read_chat_state()
+    max_ts = cursor
+    count = 0
+    suppressed = 0
+    reaction_failed = False
+    context_cache: dict[str, list[dict]] = {}
+
+    chat_jobs = []
+    write_heartbeat("list_recent_p2p_chats")
+    for chat in list_recent_p2p_chats():
+        chat_id = chat.get("chat_id", "")
+        if chat_id:
+            chat_jobs.append((chat, chat_cursors.get(chat_id, cursor)))
+
+    chat_results = []
+    write_heartbeat("fetch_p2p_messages", chat_count=len(chat_jobs))
+    with ThreadPoolExecutor(max_workers=P2P_FETCH_WORKERS) as executor:
+        futures = {
+            executor.submit(list_chat_messages_since, chat.get("chat_id", ""), chat_cursor): (chat, chat_cursor)
+            for chat, chat_cursor in chat_jobs
+        }
+        for future in as_completed(futures):
+            chat, chat_cursor = futures[future]
+            try:
+                messages = future.result()
+            except Exception as e:
+                log(f"chat fetch exception chat={chat.get('chat_id')} err={e}")
+                messages = []
+            chat_results.append((chat, chat_cursor, messages))
+
+    p2p_candidates = []
+    chat_failed_by_id: dict[str, bool] = {}
+    planned_reaction_chats: set[str] = set()
+
+    for chat, chat_cursor, messages in chat_results:
+        chat_id = chat.get("chat_id", "")
+        chat_max_ts = chat_cursor
+        chat_failed_by_id[chat_id] = False
+        candidates, local_max_ts, local_suppressed = collect_candidates_from_messages(
+            messages,
+            reacted=reacted,
+            chat_state=chat_state,
+            context_cache=context_cache,
+            planned_chats=planned_reaction_chats,
+            at_me=False,
+            default_chat_id=chat_id,
+        )
+        p2p_candidates.extend((chat, msg, context, chat_id, ts) for msg, context, chat_id, ts in candidates)
+        chat_max_ts = max(chat_max_ts, local_max_ts)
+        max_ts = max(max_ts, chat_max_ts)
+        suppressed += local_suppressed
+        if chat_max_ts > chat_cursor:
+            chat_cursors[chat_id] = chat_max_ts
+
+    write_heartbeat("send_recent_p2p_reactions", candidate_count=len(p2p_candidates))
+    recent_p2p_jobs = [(msg, context, chat_id, ts) for _chat, msg, context, chat_id, ts in p2p_candidates]
+    recent_count, recent_failed = send_reactions(
+        recent_p2p_jobs, reacted=reacted, chat_state=chat_state, at_me=False
+    )
+    count += recent_count
+    if recent_failed:
+        reaction_failed = True
+        for _chat, _msg, _context, chat_id, _ts in p2p_candidates:
+            chat_failed_by_id[chat_id] = True
+
+    write_heartbeat("update_recent_p2p_cursors")
+    chat_cursors = {
+        chat_id: ts
+        for chat_id, ts in chat_cursors.items()
+        if not chat_failed_by_id.get(chat_id, False)
+    }
+
+    write_heartbeat("search_group_mentions")
+    group_mention_messages, group_mention_ok, group_mention_has_more = search_group_mentions_since(cursor)
+    group_mention_candidates, group_mention_max_ts, group_mention_suppressed = collect_candidates_from_messages(
+        group_mention_messages,
+        reacted=reacted,
+        chat_state=chat_state,
+        context_cache=context_cache,
+        planned_chats=set(),
+        at_me=True,
+    )
+    max_ts = max(max_ts, group_mention_max_ts)
+    suppressed += group_mention_suppressed
+    group_mention_count, group_mention_failed = send_reactions(
+        group_mention_candidates, reacted=reacted, chat_state=chat_state, at_me=True
+    )
+    count += group_mention_count
+    reaction_failed = reaction_failed or group_mention_failed
+
+    write_heartbeat("search_p2p")
+    p2p_search_messages, p2p_search_ok, p2p_search_has_more = search_p2p_since(cursor)
+    p2p_search_candidates, p2p_search_max_ts, p2p_search_suppressed = collect_candidates_from_messages(
+        p2p_search_messages,
+        reacted=reacted,
+        chat_state=chat_state,
+        context_cache=context_cache,
+        planned_chats=set(),
+        at_me=False,
+    )
+    max_ts = max(max_ts, p2p_search_max_ts)
+    suppressed += p2p_search_suppressed
+    p2p_search_count, p2p_search_failed = send_reactions(
+        p2p_search_candidates, reacted=reacted, chat_state=chat_state, at_me=False
+    )
+    count += p2p_search_count
+    reaction_failed = reaction_failed or p2p_search_failed
+
+    write_heartbeat("write_state")
+    write_chat_state(chat_state)
+    write_chat_cursors(chat_cursors)
+    if max_ts > cursor and p2p_search_ok and group_mention_ok and not p2p_search_has_more and not group_mention_has_more and not reaction_failed:
+        write_cursor(max_ts)
+    elif max_ts > cursor:
+        log(
+            "cursor held back "
+            f"p2p_ok={p2p_search_ok} p2p_has_more={p2p_search_has_more} "
+            f"group_mention_ok={group_mention_ok} group_mention_has_more={group_mention_has_more} "
+            f"reaction_failed={reaction_failed} cursor={cursor} max_ts={max_ts}"
+        )
+    return {
+        "reactions": count,
+        "suppressed": suppressed,
+        "cursor": max_ts,
+        "dry_run": DRY_RUN,
+        "api_failures": API_FAILURES[api_failure_start:],
+    }
+
+
+def backtest_chat(chat_id: str, limit: int) -> dict:
+    messages = list_recent_chat_context(chat_id, limit)
+    planned_ts = 0
+    results = []
+
+    for msg in messages:
+        msg_id = msg.get("message_id", "")
+        ts = parse_create_time(msg.get("create_time", ""))
+        sender = msg.get("sender", {}) or {}
+        text = extract_text(msg)
+        row = {
+            "message_id": msg_id,
+            "create_time": msg.get("create_time", ""),
+            "sender": sender.get("name") or sender.get("sender_type") or sender.get("id") or "unknown",
+            "text_preview": text.replace("\n", " ")[:120],
+        }
+
+        if not msg_id:
+            row.update({"would_react": False, "reason": "missing_message_id"})
+        elif not is_human_sender(sender):
+            row.update({"would_react": False, "reason": "non_user_sender"})
+        elif sender.get("id") == USER_OPEN_ID:
+            row.update({"would_react": False, "reason": "self_message"})
+        elif planned_ts and ts and ts - planned_ts < CHAT_REACTION_COOLDOWN_SEC:
+            row.update({"would_react": False, "reason": "cooldown"})
+        else:
+            emoji = choose_reaction(text, msg, messages)
+            row.update({"would_react": True, "emoji_type": emoji, "reason": "eligible"})
+            planned_ts = ts or planned_ts
+        results.append(row)
+
+    return {
+        "chat_id": chat_id,
+        "limit": limit,
+        "cooldown_sec": CHAT_REACTION_COOLDOWN_SEC,
+        "message_count": len(messages),
+        "planned_reactions": sum(1 for row in results if row.get("would_react")),
+        "results": results,
+    }
+
+
+def stop(_signum, _frame) -> None:
+    global RUNNING
+    RUNNING = False
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Poll Lark messages and add user reactions.")
+    parser.add_argument("--user-open-id", help="Your Lark user open_id. By default it is read from `lark-cli auth status --json`.")
+    parser.add_argument("--state-dir", help=f"State directory. Default: {DEFAULT_STATE_DIR}")
+    parser.add_argument("--log-dir", help="Log directory. Default: <state-dir>/logs")
+    parser.add_argument("--preference", default=str(DEFAULT_PREFERENCE_PATH), help="Preference YAML path.")
+    parser.add_argument("--poll-interval", type=int)
+    parser.add_argument("--lookback-sec", type=int)
+    parser.add_argument("--p2p-scan-limit", type=int)
+    parser.add_argument("--chat-cooldown-sec", type=int)
+    parser.add_argument("--context-messages", type=int, help="Number of recent messages used as context.")
+    parser.add_argument("--emoji-allowlist", help="Comma-separated emoji_type values the model may choose.")
+    parser.add_argument("--emoji-blacklist", help="Comma-separated emoji_type values the model must not choose.")
+    parser.add_argument("--top-reactions", type=int, help="Prefer up to N recent reactions used by you in the context.")
+    parser.add_argument("--disable-llm", action="store_true", help="Use deterministic/fallback emoji rules only.")
+    parser.add_argument("--dry-run", action="store_true", help="Evaluate without sending reactions or updating scan state.")
+    parser.add_argument("--once", action="store_true", help="Run one poll cycle and exit.")
+    parser.add_argument("--print-config", action="store_true", help="Print effective non-secret config and exit.")
+    parser.add_argument("--backtest-chat", help="Run reaction selection against recent messages in one chat without sending.")
+    parser.add_argument("--limit", type=int, default=10, help="Recent message count for --backtest-chat.")
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+    configure(args)
+
+    if args.print_config:
+        print(json.dumps({
+            "user_open_id_set": bool(USER_OPEN_ID),
+            "state_dir": str(STATE_DIR),
+            "log_dir": str(LOG_DIR),
+            "preference": str(Path(args.preference).expanduser()),
+            "poll_interval_sec": POLL_INTERVAL_SEC,
+            "lookback_sec": LOOKBACK_INIT_SEC,
+            "p2p_scan_limit": P2P_SCAN_LIMIT,
+            "chat_cooldown_sec": CHAT_REACTION_COOLDOWN_SEC,
+            "emoji_blacklist": sorted(REACTION_BLACKLIST),
+            "reaction_choices": REACTION_CHOICES,
+            "top_reactions": TOP_REACTIONS,
+            "context_messages": CONTEXT_MESSAGES,
+            "style_hint_set": bool(STYLE_HINT),
+            "dry_run": DRY_RUN,
+            "disable_llm": DISABLE_LLM,
+        }, ensure_ascii=False, indent=2))
+        return
+
+    require_user_open_id()
+
+    if args.backtest_chat:
+        print(json.dumps(backtest_chat(args.backtest_chat, args.limit), ensure_ascii=False, indent=2))
+        return
+
+    global LOCK_FH
+    LOCK_FH = LOCK_FILE.open("w")
+    try:
+        fcntl.flock(LOCK_FH, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        log(f"another poller holds lock; exit pid={os.getpid()}")
+        return
+    LOCK_FH.write(str(os.getpid()))
+    LOCK_FH.flush()
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    log(f"start pid={os.getpid()} interval={POLL_INTERVAL_SEC}s dry_run={DRY_RUN}")
+    write_heartbeat("started")
+
+    while RUNNING:
+        t0 = time.time()
+        write_heartbeat("polling")
+        try:
+            result = poll_once()
+            elapsed = time.time() - t0
+            write_heartbeat("ok", elapsed_sec=round(elapsed, 3), result=result)
+            print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+            if result["reactions"]:
+                log(f"poll result={result}")
+        except Exception as e:
+            elapsed = time.time() - t0
+            write_heartbeat("error", elapsed_sec=round(elapsed, 3), error=f"{type(e).__name__}: {str(e)[:240]}")
+            log(f"poll exception err={type(e).__name__}: {str(e)[:240]}")
+            if args.once:
+                raise
+            time.sleep(2)
+            continue
+        if args.once:
+            break
+        time.sleep(max(1.0, POLL_INTERVAL_SEC - elapsed))
+
+    write_heartbeat("stopped")
+    log(f"stopped pid={os.getpid()}")
+
+
+if __name__ == "__main__":
+    main()

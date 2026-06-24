@@ -1,0 +1,37 @@
+# lark-reaction-as-user preference
+
+# 表情白名单：AI 只能从这里选。
+emoji_allowlist:
+  - OK
+  - THUMBSUP
+  - JIAYI
+  - DONE
+  - Yes
+  - Get
+  - LAUGH
+  - LOL
+  - LOVE
+  - HUSKY
+  - AWESOMEN
+
+# 表情黑名单：即使出现在白名单或历史常用里，也不要选。
+emoji_blacklist:
+  - SMILE
+  - THINKING
+
+# 每条候选消息看最近多少条上下文。
+context_messages: 10
+
+# 同一个 chat 短时间多条消息只加一次 reaction，像真人一样克制。
+chat_cooldown_sec: 300
+
+# 从最近上下文里优先参考你常用过的 reaction 数量。
+top_reactions: 5
+
+# 轮询频率和首次启动回看窗口。
+poll_interval_sec: 15
+lookback_sec: 300
+p2p_scan_limit: 5
+
+# 写给模型的个性化偏好。保持短句。
+style_hint: "克制、友好、低打扰；不确定时选 OK，不要过度热情。"

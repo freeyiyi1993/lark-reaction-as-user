@@ -1,0 +1,33 @@
+# mandatory (opensource skill enforced)
+.env
+.env.*
+*.pem
+*.key
+.netrc
+secrets/
+credentials.json
+
+# editor / OS
+.DS_Store
+.idea/
+.vscode/
+.claude/
+*.swp
+*.tmp
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# runtime state/logs
+state/
+logs/
+*.log
+
+# opensource skill: local-only announce draft, not repo content
+ANNOUNCE.md
